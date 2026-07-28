@@ -1,0 +1,511 @@
+name: Build Marzband From ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: "Optional ZIP filename in repository root"
+        required: false
+        default: ""
+
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "**/marzband_flutter_*.zip"
+      - "**/marzband_complete_*.zip"
+      - ".github/workflows/build-marzband-dual-language.yml"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: marzband-dual-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    name: Build signed release outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Delete old Marzband artifacts
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prefixes = [
+              "marzband-en-apk-",
+              "marzband-en-aab-",
+              "marzband-fa-apk-",
+              "marzband-failure-logs-"
+            ];
+
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            );
+
+            for (const artifact of artifacts) {
+              if (
+                prefixes.some(
+                  prefix => artifact.name.startsWith(prefix)
+                )
+              ) {
+                console.log(`Deleting artifact: ${artifact.name}`);
+
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+              }
+            }
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install required tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y unzip rsync
+
+          flutter --version
+          java -version
+
+      - name: Find and extract source ZIP
+        id: extract
+        shell: bash
+        env:
+          REQUESTED_ZIP: ${{ github.event.inputs.zip_name }}
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p \
+            "$GITHUB_WORKSPACE/extracted" \
+            "$GITHUB_WORKSPACE/dist" \
+            "$GITHUB_WORKSPACE/build-logs"
+
+          ZIP_FILE=""
+
+          if [[ -n "${REQUESTED_ZIP:-}" ]]; then
+            if [[ -f "$GITHUB_WORKSPACE/$REQUESTED_ZIP" ]]; then
+              ZIP_FILE="$GITHUB_WORKSPACE/$REQUESTED_ZIP"
+            else
+              echo "::error::Requested ZIP not found: $REQUESTED_ZIP"
+              exit 1
+            fi
+          fi
+
+          if [[ -z "$ZIP_FILE" ]]; then
+            CHANGED_ZIP="$(
+              git diff-tree \
+                --no-commit-id \
+                --name-only \
+                -r HEAD \
+              | grep -E '(^|/)(marzband_flutter|marzband_complete).*\.zip$' \
+              | tail -n 1 \
+              || true
+            )"
+
+            if [[ -n "$CHANGED_ZIP" ]] && [[ -f "$CHANGED_ZIP" ]]; then
+              ZIP_FILE="$GITHUB_WORKSPACE/$CHANGED_ZIP"
+            fi
+          fi
+
+          if [[ -z "$ZIP_FILE" ]]; then
+            ZIP_FILE="$(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 2 \
+                -type f \
+                \( \
+                  -name 'marzband_flutter_*.zip' \
+                  -o -name 'marzband_complete_*.zip' \
+                \) \
+                -printf '%f\t%p\n' \
+              | sort -V \
+              | tail -n 1 \
+              | cut -f2- \
+              || true
+            )"
+          fi
+
+          if [[ -z "$ZIP_FILE" ]] || [[ ! -f "$ZIP_FILE" ]]; then
+            echo "::error::No Marzband Flutter or Complete ZIP was found."
+            echo "Upload a ZIP such as:"
+            echo "marzband_flutter_v1.9.0_build23_dual-language-workflow.zip"
+            exit 1
+          fi
+
+          echo "Selected ZIP:"
+          echo "$ZIP_FILE"
+
+          unzip -q \
+            "$ZIP_FILE" \
+            -d "$GITHUB_WORKSPACE/extracted"
+
+          ENGLISH_PUBSPEC="$(
+            find "$GITHUB_WORKSPACE/extracted" \
+              -type f \
+              -path '*/apps/english/pubspec.yaml' \
+              | head -n 1
+          )"
+
+          PERSIAN_PUBSPEC="$(
+            find "$GITHUB_WORKSPACE/extracted" \
+              -type f \
+              -path '*/apps/persian/pubspec.yaml' \
+              | head -n 1
+          )"
+
+          if [[ -z "$ENGLISH_PUBSPEC" ]]; then
+            echo "::error::apps/english/pubspec.yaml was not found inside ZIP."
+
+            find "$GITHUB_WORKSPACE/extracted" \
+              -maxdepth 6 \
+              -type f \
+              | sort \
+              | head -n 200
+
+            exit 1
+          fi
+
+          if [[ -z "$PERSIAN_PUBSPEC" ]]; then
+            echo "::error::apps/persian/pubspec.yaml was not found inside ZIP."
+            exit 1
+          fi
+
+          PROJECT_ROOT="${ENGLISH_PUBSPEC%/apps/english/pubspec.yaml}"
+
+          if [[ ! -d "$PROJECT_ROOT/apps/english" ]]; then
+            echo "::error::English project directory is invalid."
+            exit 1
+          fi
+
+          if [[ ! -d "$PROJECT_ROOT/apps/persian" ]]; then
+            echo "::error::Persian project directory is invalid."
+            exit 1
+          fi
+
+          VERSION_RAW="$(
+            awk '/^version:/ { print $2; exit }' \
+              "$PROJECT_ROOT/apps/english/pubspec.yaml"
+          )"
+
+          if [[ -z "$VERSION_RAW" ]]; then
+            echo "::error::Version was not found in English pubspec.yaml."
+            exit 1
+          fi
+
+          VERSION_NAME="${VERSION_RAW%%+*}"
+          BUILD_NUMBER="${VERSION_RAW##*+}"
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "SOURCE_ZIP=$ZIP_FILE" >> "$GITHUB_ENV"
+
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "ZIP_FILE=$ZIP_FILE"
+            echo "PROJECT_ROOT=$PROJECT_ROOT"
+            echo "VERSION_NAME=$VERSION_NAME"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+          } | tee "$GITHUB_WORKSPACE/build-logs/source-info.log"
+
+          echo
+          echo "Detected source structure:"
+
+          find "$PROJECT_ROOT" \
+            -maxdepth 3 \
+            -type f \
+            | sort \
+            | head -n 100
+
+      - name: Generate Android projects and apply release overlays
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          prepare_variant() {
+            local language="$1"
+            local app_dir="$PROJECT_ROOT/apps/$language"
+            local log_dir="$GITHUB_WORKSPACE/build-logs"
+
+            echo "Preparing language: $language"
+            echo "Project directory: $app_dir"
+
+            if [[ ! -f "$app_dir/pubspec.yaml" ]]; then
+              echo "::error::Missing pubspec.yaml for $language"
+              exit 1
+            fi
+
+            if [[ ! -d "$app_dir/tooling/android_overlay" ]]; then
+              echo "::error::Missing Android overlay for $language"
+              exit 1
+            fi
+
+            rm -rf "$app_dir/android"
+
+            pushd "$app_dir" >/dev/null
+
+            flutter create \
+              --platforms=android \
+              --project-name marzband \
+              --org mk.kadkhodai \
+              . 2>&1 \
+              | tee "$log_dir/${language}-flutter-create.log"
+
+            rsync -a \
+              tooling/android_overlay/ \
+              android/
+
+            flutter pub get 2>&1 \
+              | tee "$log_dir/${language}-pub-get.log"
+
+            # Remove Flutter's stale default test when it still
+            # references the nonexistent MyApp class.
+            if [[ -f test/widget_test.dart ]] && \
+               grep -qE '\bMyApp\s*\(' test/widget_test.dart; then
+
+              echo "Removing stale widget_test.dart for $language"
+
+              rm -f test/widget_test.dart
+            fi
+
+            popd >/dev/null
+          }
+
+          prepare_variant english
+          prepare_variant persian
+
+      - name: Validate English source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT/apps/english"
+
+          flutter analyze \
+            --no-fatal-warnings \
+            --no-fatal-infos 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-logs/english-analyze.log"
+
+          if [[ -d test ]] && \
+             find test \
+               -type f \
+               -name '*_test.dart' \
+               -print \
+               -quit \
+             | grep -q .; then
+
+            flutter test 2>&1 \
+              | tee "$GITHUB_WORKSPACE/build-logs/english-test.log"
+          else
+            echo "No English tests found." \
+              | tee "$GITHUB_WORKSPACE/build-logs/english-test.log"
+          fi
+
+      - name: Validate Persian source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT/apps/persian"
+
+          flutter analyze \
+            --no-fatal-warnings \
+            --no-fatal-infos 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-logs/persian-analyze.log"
+
+          if [[ -d test ]] && \
+             find test \
+               -type f \
+               -name '*_test.dart' \
+               -print \
+               -quit \
+             | grep -q .; then
+
+            flutter test 2>&1 \
+              | tee "$GITHUB_WORKSPACE/build-logs/persian-test.log"
+          else
+            echo "No Persian tests found." \
+              | tee "$GITHUB_WORKSPACE/build-logs/persian-test.log"
+          fi
+
+      - name: Build signed English APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT/apps/english"
+
+          flutter build apk \
+            --release 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-logs/english-apk-build.log"
+
+          cp \
+            build/app/outputs/flutter-apk/app-release.apk \
+            "$GITHUB_WORKSPACE/dist/Marzband-v${VERSION_NAME}-build${BUILD_NUMBER}-en.apk"
+
+      - name: Build signed English AAB
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT/apps/english"
+
+          flutter build appbundle \
+            --release 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-logs/english-aab-build.log"
+
+          cp \
+            build/app/outputs/bundle/release/app-release.aab \
+            "$GITHUB_WORKSPACE/dist/Marzband-v${VERSION_NAME}-build${BUILD_NUMBER}-en.aab"
+
+      - name: Build signed Persian APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_ROOT/apps/persian"
+
+          flutter build apk \
+            --release 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-logs/persian-apk-build.log"
+
+          cp \
+            build/app/outputs/flutter-apk/app-release.apk \
+            "$GITHUB_WORKSPACE/dist/Marzband-v${VERSION_NAME}-build${BUILD_NUMBER}-fa.apk"
+
+      - name: Verify outputs and create checksums
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          EN_APK="Marzband-v${VERSION_NAME}-build${BUILD_NUMBER}-en.apk"
+          EN_AAB="Marzband-v${VERSION_NAME}-build${BUILD_NUMBER}-en.aab"
+          FA_APK="Marzband-v${VERSION_NAME}-build${BUILD_NUMBER}-fa.apk"
+
+          test -s "$GITHUB_WORKSPACE/dist/$EN_APK"
+          test -s "$GITHUB_WORKSPACE/dist/$EN_AAB"
+          test -s "$GITHUB_WORKSPACE/dist/$FA_APK"
+
+          cd "$GITHUB_WORKSPACE/dist"
+
+          sha256sum "$EN_APK" > "$EN_APK.sha256"
+          sha256sum "$EN_AAB" > "$EN_AAB.sha256"
+          sha256sum "$FA_APK" > "$FA_APK.sha256"
+
+          ls -lh
+
+      - name: Upload English APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: marzband-en-apk-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}
+          path: |
+            dist/Marzband-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}-en.apk
+            dist/Marzband-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}-en.apk.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload English AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: marzband-en-aab-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}
+          path: |
+            dist/Marzband-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}-en.aab
+            dist/Marzband-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}-en.aab.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload Persian APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: marzband-fa-apk-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}
+          path: |
+            dist/Marzband-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}-fa.apk
+            dist/Marzband-v${{ env.VERSION_NAME }}-build${{ env.BUILD_NUMBER }}-fa.apk.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+
+          flutter doctor -v \
+            > "$GITHUB_WORKSPACE/build-logs/flutter-doctor.log" \
+            2>&1
+
+          echo "Repository files:" \
+            > "$GITHUB_WORKSPACE/build-logs/repository-files.log"
+
+          find "$GITHUB_WORKSPACE" \
+            -maxdepth 6 \
+            -type f \
+            | sort \
+            >> "$GITHUB_WORKSPACE/build-logs/repository-files.log" \
+            2>&1
+
+          if [[ -n "${PROJECT_ROOT:-}" ]] && \
+             [[ -d "$PROJECT_ROOT" ]]; then
+
+            find "$PROJECT_ROOT/apps" \
+              -path "*/build/app/outputs/*" \
+              -type f \
+              -print \
+              > "$GITHUB_WORKSPACE/build-logs/generated-output-files.log" \
+              2>&1
+          fi
+
+          find "$GITHUB_WORKSPACE" \
+            \( \
+              -name "*.log" \
+              -o -name "hs_err_pid*.log" \
+            \) \
+            -type f \
+            -print \
+            > "$GITHUB_WORKSPACE/build-logs/discovered-log-files.log" \
+            2>&1
+
+      - name: Upload failure logs
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: marzband-failure-logs-${{ github.run_number }}
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 7
